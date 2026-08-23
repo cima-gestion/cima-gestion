@@ -912,231 +912,84 @@ let lastKnownRemoteUpdatedAt = null;
    las demás), combinamos listas por "id": lo que agregó cada persona se
    conserva, y si dos personas editaron el MISMO registro, gana la versión
    local (la de quien está guardando en este momento). */
-function mergeArraysById(remoteArr, localArr, idKey){
-  idKey = idKey || 'id';
-  const map = new Map();
-  (Array.isArray(remoteArr) ? remoteArr : []).forEach(item => {
-    if (item && item[idKey] != null) map.set(item[idKey], item);
-  });
-  (Array.isArray(localArr) ? localArr : []).forEach(item => {
-    if (item && item[idKey] != null) map.set(item[idKey], item); // local pisa remoto si hay conflicto
-  });
-  return Array.from(map.values());
+function dbDate(v){
+  if(v===null || v===undefined || v==='') return null;
+  if(typeof v==='number' || /^\d+$/.test(String(v))) return new Date(Number(v)).toISOString();
+  return v;
 }
-
-function mergeCloudState(remoteData, localData){
-  if (!remoteData) return localData;
-  if (!localData) return remoteData;
-  const merged = JSON.parse(JSON.stringify(localData));
-
-  merged.properties = mergeArraysById(remoteData.properties, localData.properties, 'id');
-  merged.leads = mergeArraysById(remoteData.leads, localData.leads, 'id');
-  merged.bitacora = mergeArraysById(remoteData.bitacora, localData.bitacora, 'id');
-
-  merged.folders = Array.from(new Set([...(remoteData.folders || []), ...(localData.folders || [])]));
-  merged.platforms = Array.from(new Set([...(remoteData.platforms || []), ...(localData.platforms || [])]));
-  merged.collapsedFolders = Object.assign({}, remoteData.collapsedFolders || {}, localData.collapsedFolders || {});
-
-  const remoteT = remoteData.templates || {};
-  const localT = localData.templates || {};
-  merged.templates = {
-    whatsapp: mergeArraysById(remoteT.whatsapp, localT.whatsapp, 'id'),
-    facebook: mergeArraysById(remoteT.facebook, localT.facebook, 'id')
+function rowToProperty(r, platforms, history){
+  const p={
+    id:r.id,name:r.name,address:r.address||'',floor:r.floor||'',price:r.price,
+    priceCurrency:r.price_currency||'CLP',propertyType:r.property_type||'Departamento',
+    specs:r.specs||{},folder:r.folder||'',folderPath:r.folder_path||'',
+    dealStatus:r.deal_status||'activa',dealDate:r.deal_date||null,listedDate:r.listed_date||null,
+    createdAt:r.created_at ? new Date(r.created_at).getTime() : Date.now(),
+    collapsed:!!r.collapsed,excludedPlatforms:r.excluded_platforms||[],texts:{},titles:{},status:{},priceHistory:[]
   };
-
-  return merged;
+  (platforms||[]).filter(x=>x.property_id===r.id).forEach(x=>{
+    p.titles[x.platform]=x.title||p.name;
+    p.texts[x.platform]=x.text||'';
+    p.status[x.platform]={state:x.status_state||'none',publishedDate:x.published_date||null,deletedDate:x.deleted_date||null};
+  });
+  p.priceHistory=(history||[]).filter(x=>x.property_id===r.id).map(x=>({date:x.history_date,price:x.price,currency:x.currency||p.priceCurrency}));
+  return p;
 }
+function propertyRow(p){ return {
+  id:p.id,name:p.name,address:p.address||null,floor:p.floor||null,price:p.price===''?null:p.price,
+  price_currency:p.priceCurrency||'CLP',property_type:p.propertyType||null,specs:p.specs||{},folder:p.folder||null,
+  folder_path:p.folderPath||null,deal_status:p.dealStatus||null,deal_date:p.dealDate||null,listed_date:p.listedDate||null,
+  created_at:dbDate(p.createdAt)||new Date().toISOString(),collapsed:!!p.collapsed,excluded_platforms:p.excludedPlatforms||[]
+}; }
+function platformRows(p){
+  const names=new Set([...Object.keys(p.titles||{}),...Object.keys(p.texts||{}),...Object.keys(p.status||{})]);
+  return [...names].map(platform=>{const st=(p.status||{})[platform]||{};return {property_id:p.id,platform,title:(p.titles||{})[platform]||p.name,text:(p.texts||{})[platform]||'',status_state:st.state||'none',published_date:st.publishedDate||null,deleted_date:st.deletedDate||null};});
+}
+function historyRows(p){ return (p.priceHistory||[]).map(h=>({property_id:p.id,history_date:h.date||null,price:h.price===''?null:h.price,currency:h.currency||p.priceCurrency||'CLP'})); }
 
-async function saveToCloud() {
-  if (!supabaseClient || !cloudReady || cloudLoading || applyingCloudData) return false;
-  if (!cloudSaveQueued) return true;
-
-  try {
+async function saveToCloud(){
+  if(!supabaseClient || !cloudReady || cloudLoading || applyingCloudData) return false;
+  if(!cloudSaveQueued) return true;
+  try{
     setCloudStatus('Sincronizando...');
-
-    // No hacemos un SELECT antes de cada guardado. Realtime ya informa de los
-    // cambios remotos; esta comprobación periódica funciona como reconciliación
-    // de respaldo por si se perdió una notificación.
-    const nowMs = Date.now();
-    if (nowMs - lastCloudCheckAt >= CLOUD_RECONCILE_INTERVAL) {
-      const { data: remoteRow, error: fetchErr } = await supabaseClient
-        .from('cima_data')
-        .select('id,data,updated_at')
-        .eq('id', 'global_state')
-        .maybeSingle();
-      if (fetchErr) throw fetchErr;
-      lastCloudCheckAt = nowMs;
-
-      if (remoteRow && remoteRow.data && remoteRow.updated_at !== lastKnownRemoteUpdatedAt) {
-        pendingRemoteState = remoteRow.data;
-        pendingRemoteUpdatedAt = remoteRow.updated_at;
-        remoteChangesPending = true;
-        scheduleRemoteApply();
-      }
-    }
-
-    const payload = {
-      id: 'global_state',
-      data: JSON.parse(JSON.stringify(state)),
-      updated_at: new Date().toISOString()
-    };
-
-    lastSavedUpdatedAt = payload.updated_at;
-    const { error } = await supabaseClient
-      .from('cima_data')
-      .upsert(payload, { onConflict: 'id' });
-    if (error) throw error;
-
-    cloudSaveQueued = false;
-    lastKnownRemoteUpdatedAt = payload.updated_at;
-    const now = new Date().toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' });
-    setCloudStatus('Sincronizado ' + now + ' ✅');
-    return true;
-  } catch (err) {
-    console.error('Error al guardar en Supabase:', err);
-    setCloudStatus('Error de sincronización');
-    showToast('Supabase: ' + describeSupabaseError(err));
-    // Mantener la cola activa permite reintentar sin perder el cambio local.
-    cloudSaveQueued = true;
-    return false;
-  }
-}
-
-async function loadFromCloud() {
-  if (!supabaseClient) {
-    setCloudStatus('Cliente no disponible');
-    return;
-  }
-  cloudLoading = true;
-  try {
-    setCloudStatus('Cargando de la nube...');
-    const { data: row, error } = await supabaseClient
-      .from('cima_data')
-      .select('id,data,updated_at')
-      .eq('id', 'global_state')
-      .maybeSingle();
-    if (error) throw error;
-
-    if (row && row.data) {
-      applyingCloudData = true;
-      try { applyImportedData(row.data, true); }
-      finally { applyingCloudData = false; }
-      cloudReady = true;
-      lastKnownRemoteUpdatedAt = row.updated_at || null;
-      const time = row.updated_at
-        ? new Date(row.updated_at).toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' })
-        : null;
-      setCloudStatus(time ? 'Conectado · ' + time + ' ✅' : 'Conectado a la nube ✅');
-      showToast('Datos cargados de Supabase');
-    } else {
-      cloudReady = true;
-      cloudSaveQueued = true;
-      await saveToCloud();
-      setCloudStatus('Conectado a la nube · estado inicial creado ✅');
-    }
-  } catch (err) {
-    cloudReady = false;
-    console.error('Error al leer de Supabase:', err);
-    setCloudStatus('Error: ' + (err.code || 'conexión'));
-    showToast('Supabase: ' + describeSupabaseError(err));
-  } finally {
-    cloudLoading = false;
-  }
-}
-
-/*
-   MULTIUSUARIO SIN BLOQUEOS:
-   Realtime ya no reconstruye la interfaz cada vez que otra persona guarda.
-   Antes, cada evento remoto ejecutaba applyImportedData(...), que terminaba
-   renderizando la pestaña completa. Con dos computadores eso podía ocurrir
-   cada pocos segundos y hacía que el navegador pareciera congelado.
-
-   Ahora Realtime funciona como una NOTIFICACIÓN. Guardamos el último estado
-   remoto recibido y lo aplicamos solamente cuando el usuario local está en
-   reposo. Varios cambios remotos seguidos se agrupan en una sola actualización.
-*/
-let pendingRemoteState = null;
-let pendingRemoteUpdatedAt = null;
-let remoteApplyTimer = null;
-let lastUserInteractionAt = 0;
-let remoteChangesPending = false;
-
-function markUserInteraction(){
-  lastUserInteractionAt = Date.now();
-  if(remoteChangesPending) scheduleRemoteApply();
-}
-
-['pointerdown','keydown','input','change'].forEach(evt => {
-  document.addEventListener(evt, markUserInteraction, {passive:true});
-});
-
-function scheduleRemoteApply(){
-  clearTimeout(remoteApplyTimer);
-  remoteApplyTimer = setTimeout(() => {
-    const idleFor = Date.now() - lastUserInteractionAt;
-    const requiredIdle = 1800;
-    if(idleFor < requiredIdle){
-      scheduleRemoteApply();
-      return;
-    }
-    applyPendingRemoteState();
-  }, 900);
-}
-
-function applyPendingRemoteState(){
-  if(!pendingRemoteState || cloudLoading || applyingCloudData) return;
-
-  const remoteData = pendingRemoteState;
-  const remoteUpdatedAt = pendingRemoteUpdatedAt;
-  pendingRemoteState = null;
-  pendingRemoteUpdatedAt = null;
-  remoteChangesPending = false;
-
-  applyingCloudData = true;
-  try {
-    // Fusionamos por registro. Los cambios locales que el usuario acaba de
-    // realizar siguen teniendo prioridad en caso de conflicto sobre el mismo ID.
-    state = mergeCloudState(remoteData, state);
     normalizeState(state);
-    persistLocalState();
-    lastKnownRemoteUpdatedAt = remoteUpdatedAt || lastKnownRemoteUpdatedAt;
-
-    // Una sola actualización visual cuando el usuario está libre.
-    renderCurrentTab();
-    setCloudStatus('Actualizado desde otro equipo');
-  } finally {
-    applyingCloudData = false;
-  }
+    const jobs=[];
+    jobs.push(supabaseClient.from('properties').upsert(state.properties.map(propertyRow),{onConflict:'id'}));
+    const pp=state.properties.flatMap(platformRows); if(pp.length) jobs.push(supabaseClient.from('property_platforms').upsert(pp,{onConflict:'property_id,platform'}));
+    const ph=state.properties.flatMap(historyRows); if(ph.length) jobs.push(supabaseClient.from('property_price_history').upsert(ph,{onConflict:'id'}));
+    jobs.push(supabaseClient.from('leads').upsert((state.leads||[]).map(x=>({id:x.id,name:x.name||'',phone:x.phone||null,notes:x.notes||null,stage:x.stage||null,status:x.status||null,channel:x.channel||null,property:x.property||null,operation:x.operation||null,first_contact:x.firstContact||null,last_contact:x.lastContact||null,collapsed:!!x.collapsed})),{onConflict:'id'}));
+    jobs.push(supabaseClient.from('folders').upsert((state.folders||[]).map(name=>({name})),{onConflict:'name'}));
+    jobs.push(supabaseClient.from('platforms').upsert((state.platforms||[]).map(name=>({name})),{onConflict:'name'}));
+    const templates=[]; Object.entries(state.templates||{}).forEach(([platform,list])=>(Array.isArray(list)?list:[]).forEach(t=>templates.push({id:t.id||uid(),platform,title:t.title||null,text:t.text||null,shortcut:t.shortcut||null,collapsed:!!t.collapsed})));
+    if(templates.length) jobs.push(supabaseClient.from('templates').upsert(templates,{onConflict:'id'}));
+    jobs.push(supabaseClient.from('app_settings').upsert({id:'global',settings:{settings:state.settings||{},collapsedFolders:state.collapsedFolders||{}},sort_order:state.sortOrder||null},{onConflict:'id'}));
+    const results=await Promise.all(jobs); const bad=results.find(r=>r.error); if(bad) throw bad.error;
+    cloudSaveQueued=false; const now=new Date().toLocaleTimeString('es-CL',{hour:'2-digit',minute:'2-digit'}); setCloudStatus('Sincronizado '+now+' ✅'); return true;
+  }catch(err){ console.error('Error al guardar en Supabase:',err); setCloudStatus('Error de sincronización'); showToast('Supabase: '+describeSupabaseError(err)); cloudSaveQueued=true; return false; }
 }
 
-if (supabaseClient) {
-  supabaseClient
-    .channel('cima-data-realtime')
-    .on('postgres_changes', {
-      event: '*', schema: 'public', table: 'cima_data', filter: 'id=eq.global_state'
-    }, payload => {
-      if (!payload.new || !payload.new.data || cloudLoading) return;
+async function loadFromCloud(){
+  if(!supabaseClient){setCloudStatus('Cliente no disponible');return;}
+  cloudLoading=true;
+  try{
+    setCloudStatus('Cargando datos...');
+    const [pr,pp,ph,le,fo,pl,te,as,bi]=await Promise.all([
+      supabaseClient.from('properties').select('*'),supabaseClient.from('property_platforms').select('*'),supabaseClient.from('property_price_history').select('*'),supabaseClient.from('leads').select('*'),supabaseClient.from('folders').select('*'),supabaseClient.from('platforms').select('*'),supabaseClient.from('templates').select('*'),supabaseClient.from('app_settings').select('*').eq('id','global').maybeSingle(),supabaseClient.from('bitacora').select('*')
+    ]);
+    const all=[pr,pp,ph,le,fo,pl,te,as,bi]; const bad=all.find(r=>r.error); if(bad) throw bad.error;
+    const settingsRow=as.data||{}; const st=settingsRow.settings||{};
+    const remote={properties:(pr.data||[]).map(r=>rowToProperty(r,pp.data||[],ph.data||[])),leads:(le.data||[]).map(x=>({id:x.id,name:x.name,phone:x.phone,notes:x.notes,stage:x.stage,status:x.status,channel:x.channel,property:x.property,operation:x.operation,firstContact:x.first_contact,lastContact:x.last_contact,collapsed:x.collapsed})),folders:(fo.data||[]).map(x=>x.name),platforms:(pl.data||[]).map(x=>x.name),templates:{whatsapp:[],facebook:[]},settings:st.settings||{},collapsedFolders:st.collapsedFolders||{},sortOrder:settingsRow.sort_order||'',bitacora:(bi.data||[]).map(x=>x.data||{id:x.id,date:x.entry_date,activity:x.activity})};
+    (te.data||[]).forEach(x=>{if(!remote.templates[x.platform]) remote.templates[x.platform]=[]; remote.templates[x.platform].push({id:x.id,title:x.title,text:x.text,shortcut:x.shortcut,collapsed:x.collapsed});});
+    applyingCloudData=true; try{applyImportedData(remote,true);}finally{applyingCloudData=false;}
+    cloudReady=true; setCloudStatus('Conectado a la nube ✅'); showToast('Datos cargados desde las tablas nuevas');
+  }catch(err){cloudReady=false;console.error('Error al leer de Supabase:',err);setCloudStatus('Error: '+(err.code||'conexión'));showToast('Supabase: '+describeSupabaseError(err));}
+  finally{cloudLoading=false;}
+}
 
-      // Ignorar el eco de nuestro propio guardado.
-      if (payload.new.updated_at && payload.new.updated_at === lastSavedUpdatedAt) {
-        cloudReady = true;
-        lastKnownRemoteUpdatedAt = payload.new.updated_at;
-        return;
-      }
-
-      // No renderizar inmediatamente. Solo guardar el último estado remoto.
-      pendingRemoteState = payload.new.data;
-      pendingRemoteUpdatedAt = payload.new.updated_at || null;
-      remoteChangesPending = true;
-      cloudReady = true;
-
-      setCloudStatus('Cambio de otro equipo pendiente...');
-      scheduleRemoteApply();
-    })
-    .subscribe(status => {
-      if (status === 'SUBSCRIBED') console.info('Supabase Realtime conectado');
-      else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') console.warn('Supabase Realtime:', status);
-    });
+if(supabaseClient){
+  supabaseClient.channel('cima-multi-table-realtime')
+  .on('postgres_changes',{event:'*',schema:'public',table:'properties'},()=>{if(!cloudLoading){setCloudStatus('Cambio remoto detectado...');setTimeout(()=>loadFromCloud(),700);}})
+  .on('postgres_changes',{event:'*',schema:'public',table:'leads'},()=>{if(!cloudLoading)setTimeout(()=>loadFromCloud(),700);})
+  .subscribe(status=>{if(status==='SUBSCRIBED')console.info('Supabase Realtime conectado a tablas nuevas');});
 }
 
 /* =====================================================================
