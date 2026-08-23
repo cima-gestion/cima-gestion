@@ -968,11 +968,10 @@ async function saveToCloud() {
       lastCloudCheckAt = nowMs;
 
       if (remoteRow && remoteRow.data && remoteRow.updated_at !== lastKnownRemoteUpdatedAt) {
-        const stateToSave = mergeCloudState(remoteRow.data, state);
-        state = stateToSave;
-        persistLocalState();
-        renderCurrentTab();
-        lastKnownRemoteUpdatedAt = remoteRow.updated_at;
+        pendingRemoteState = remoteRow.data;
+        pendingRemoteUpdatedAt = remoteRow.updated_at;
+        remoteChangesPending = true;
+        scheduleRemoteApply();
       }
     }
 
@@ -1045,6 +1044,71 @@ async function loadFromCloud() {
   }
 }
 
+/*
+   MULTIUSUARIO SIN BLOQUEOS:
+   Realtime ya no reconstruye la interfaz cada vez que otra persona guarda.
+   Antes, cada evento remoto ejecutaba applyImportedData(...), que terminaba
+   renderizando la pestaña completa. Con dos computadores eso podía ocurrir
+   cada pocos segundos y hacía que el navegador pareciera congelado.
+
+   Ahora Realtime funciona como una NOTIFICACIÓN. Guardamos el último estado
+   remoto recibido y lo aplicamos solamente cuando el usuario local está en
+   reposo. Varios cambios remotos seguidos se agrupan en una sola actualización.
+*/
+let pendingRemoteState = null;
+let pendingRemoteUpdatedAt = null;
+let remoteApplyTimer = null;
+let lastUserInteractionAt = 0;
+let remoteChangesPending = false;
+
+function markUserInteraction(){
+  lastUserInteractionAt = Date.now();
+  if(remoteChangesPending) scheduleRemoteApply();
+}
+
+['pointerdown','keydown','input','change'].forEach(evt => {
+  document.addEventListener(evt, markUserInteraction, {passive:true});
+});
+
+function scheduleRemoteApply(){
+  clearTimeout(remoteApplyTimer);
+  remoteApplyTimer = setTimeout(() => {
+    const idleFor = Date.now() - lastUserInteractionAt;
+    const requiredIdle = 1800;
+    if(idleFor < requiredIdle){
+      scheduleRemoteApply();
+      return;
+    }
+    applyPendingRemoteState();
+  }, 900);
+}
+
+function applyPendingRemoteState(){
+  if(!pendingRemoteState || cloudLoading || applyingCloudData) return;
+
+  const remoteData = pendingRemoteState;
+  const remoteUpdatedAt = pendingRemoteUpdatedAt;
+  pendingRemoteState = null;
+  pendingRemoteUpdatedAt = null;
+  remoteChangesPending = false;
+
+  applyingCloudData = true;
+  try {
+    // Fusionamos por registro. Los cambios locales que el usuario acaba de
+    // realizar siguen teniendo prioridad en caso de conflicto sobre el mismo ID.
+    state = mergeCloudState(remoteData, state);
+    normalizeState(state);
+    persistLocalState();
+    lastKnownRemoteUpdatedAt = remoteUpdatedAt || lastKnownRemoteUpdatedAt;
+
+    // Una sola actualización visual cuando el usuario está libre.
+    renderCurrentTab();
+    setCloudStatus('Actualizado desde otro equipo');
+  } finally {
+    applyingCloudData = false;
+  }
+}
+
 if (supabaseClient) {
   supabaseClient
     .channel('cima-data-realtime')
@@ -1052,19 +1116,22 @@ if (supabaseClient) {
       event: '*', schema: 'public', table: 'cima_data', filter: 'id=eq.global_state'
     }, payload => {
       if (!payload.new || !payload.new.data || cloudLoading) return;
-      // Ignorar el "eco" de nuestro propio guardado: si el updated_at que llega
-      // es el mismo que acabamos de enviar nosotros, no hay nada nuevo que aplicar.
+
+      // Ignorar el eco de nuestro propio guardado.
       if (payload.new.updated_at && payload.new.updated_at === lastSavedUpdatedAt) {
         cloudReady = true;
         lastKnownRemoteUpdatedAt = payload.new.updated_at;
         return;
       }
-      applyingCloudData = true;
-      try { applyImportedData(payload.new.data, true, true); }
-      finally { applyingCloudData = false; }
+
+      // No renderizar inmediatamente. Solo guardar el último estado remoto.
+      pendingRemoteState = payload.new.data;
+      pendingRemoteUpdatedAt = payload.new.updated_at || null;
+      remoteChangesPending = true;
       cloudReady = true;
-      lastKnownRemoteUpdatedAt = payload.new.updated_at || null;
-      showToast('Datos actualizados en tiempo real');
+
+      setCloudStatus('Cambio de otro equipo pendiente...');
+      scheduleRemoteApply();
     })
     .subscribe(status => {
       if (status === 'SUBSCRIBED') console.info('Supabase Realtime conectado');
@@ -1296,7 +1363,7 @@ let cloudDebounceTimer = null;
 let localSaveTimer = null;
 let cloudSaveQueued = false;
 let lastCloudCheckAt = 0;
-const CLOUD_RECONCILE_INTERVAL = 15000;
+const CLOUD_RECONCILE_INTERVAL = 60000;
 
 // Persistencia local ligera: una sola clave es suficiente durante el uso normal.
 // Las claves antiguas se conservan para recuperación/migración, pero ya no se
