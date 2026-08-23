@@ -1106,6 +1106,7 @@ function normalizeState(data){
   }
 
   data.properties.forEach(p => normalizeProperty(p, data.folders[0]));
+  return data;
 }
 
 function loadState(){
