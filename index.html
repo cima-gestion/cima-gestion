@@ -903,19 +903,89 @@ function describeSupabaseError(err) {
   return [err.message, err.details, err.hint, err.code].filter(Boolean).join(' | ');
 }
 
+let lastSavedUpdatedAt = null;
+let lastKnownRemoteUpdatedAt = null;
+
+/* ---- Fusión de estados para trabajo simultáneo entre varias personas ----
+   En vez de reemplazar todo el JSON de la nube por el local (lo que hacía
+   que la última persona en guardar borrara silenciosamente los cambios de
+   las demás), combinamos listas por "id": lo que agregó cada persona se
+   conserva, y si dos personas editaron el MISMO registro, gana la versión
+   local (la de quien está guardando en este momento). */
+function mergeArraysById(remoteArr, localArr, idKey){
+  idKey = idKey || 'id';
+  const map = new Map();
+  (Array.isArray(remoteArr) ? remoteArr : []).forEach(item => {
+    if (item && item[idKey] != null) map.set(item[idKey], item);
+  });
+  (Array.isArray(localArr) ? localArr : []).forEach(item => {
+    if (item && item[idKey] != null) map.set(item[idKey], item); // local pisa remoto si hay conflicto
+  });
+  return Array.from(map.values());
+}
+
+function mergeCloudState(remoteData, localData){
+  if (!remoteData) return localData;
+  if (!localData) return remoteData;
+  const merged = JSON.parse(JSON.stringify(localData));
+
+  merged.properties = mergeArraysById(remoteData.properties, localData.properties, 'id');
+  merged.leads = mergeArraysById(remoteData.leads, localData.leads, 'id');
+  merged.bitacora = mergeArraysById(remoteData.bitacora, localData.bitacora, 'id');
+
+  merged.folders = Array.from(new Set([...(remoteData.folders || []), ...(localData.folders || [])]));
+  merged.platforms = Array.from(new Set([...(remoteData.platforms || []), ...(localData.platforms || [])]));
+  merged.collapsedFolders = Object.assign({}, remoteData.collapsedFolders || {}, localData.collapsedFolders || {});
+
+  const remoteT = remoteData.templates || {};
+  const localT = localData.templates || {};
+  merged.templates = {
+    whatsapp: mergeArraysById(remoteT.whatsapp, localT.whatsapp, 'id'),
+    facebook: mergeArraysById(remoteT.facebook, localT.facebook, 'id')
+  };
+
+  return merged;
+}
+
 async function saveToCloud() {
   if (!supabaseClient || !cloudReady || cloudLoading || applyingCloudData) return false;
   try {
     setCloudStatus('Sincronizando...');
+
+    // 1) Ver si alguien más guardó cambios que todavía no tenemos localmente.
+    const { data: remoteRow, error: fetchErr } = await supabaseClient
+      .from('cima_data')
+      .select('id,data,updated_at')
+      .eq('id', 'global_state')
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+
+    let stateToSave = state;
+    if (remoteRow && remoteRow.data && remoteRow.updated_at !== lastKnownRemoteUpdatedAt) {
+      // Hay una versión en la nube más nueva que la última que vimos: fusionamos
+      // en vez de pisarla.
+      stateToSave = mergeCloudState(remoteRow.data, state);
+      applyingCloudData = true;
+      try {
+        state = stateToSave;
+        ALL_POSSIBLE_KEYS.forEach(k => localStorage.setItem(k, JSON.stringify(state)));
+        renderAll();
+      } finally {
+        applyingCloudData = false;
+      }
+    }
+
     const payload = {
       id: 'global_state',
-      data: JSON.parse(JSON.stringify(state)),
+      data: JSON.parse(JSON.stringify(stateToSave)),
       updated_at: new Date().toISOString()
     };
+    lastSavedUpdatedAt = payload.updated_at;
     const { error } = await supabaseClient
       .from('cima_data')
       .upsert(payload, { onConflict: 'id' });
     if (error) throw error;
+    lastKnownRemoteUpdatedAt = payload.updated_at;
     const now = new Date().toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' });
     setCloudStatus('Sincronizado ' + now + ' ✅');
     return true;
@@ -947,6 +1017,7 @@ async function loadFromCloud() {
       try { applyImportedData(row.data, true); }
       finally { applyingCloudData = false; }
       cloudReady = true;
+      lastKnownRemoteUpdatedAt = row.updated_at || null;
       const time = row.updated_at
         ? new Date(row.updated_at).toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' })
         : null;
@@ -974,10 +1045,18 @@ if (supabaseClient) {
       event: '*', schema: 'public', table: 'cima_data', filter: 'id=eq.global_state'
     }, payload => {
       if (!payload.new || !payload.new.data || cloudLoading) return;
+      // Ignorar el "eco" de nuestro propio guardado: si el updated_at que llega
+      // es el mismo que acabamos de enviar nosotros, no hay nada nuevo que aplicar.
+      if (payload.new.updated_at && payload.new.updated_at === lastSavedUpdatedAt) {
+        cloudReady = true;
+        lastKnownRemoteUpdatedAt = payload.new.updated_at;
+        return;
+      }
       applyingCloudData = true;
       try { applyImportedData(payload.new.data, true); }
       finally { applyingCloudData = false; }
       cloudReady = true;
+      lastKnownRemoteUpdatedAt = payload.new.updated_at || null;
       showToast('Datos actualizados en tiempo real');
     })
     .subscribe(status => {
@@ -1215,7 +1294,7 @@ function saveState(){
     clearTimeout(cloudDebounceTimer);
     cloudDebounceTimer = setTimeout(() => {
       if (cloudReady && !cloudLoading && !applyingCloudData) saveToCloud();
-    }, 1500);
+    }, 2500);
   }catch(e){
     console.error('Error guardando', e);
     showToast('⚠️ Error al guardar automáticamente');
