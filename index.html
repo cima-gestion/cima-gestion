@@ -876,12 +876,16 @@ const DOSSIER_STUDIO_B64 = "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVzIj4KPGhlYWQ+
 ";
 
 /* =====================================================================
-   PERSISTENCIA EN LA NUBE — Supabase (Gratuito y Automático)
+   PERSISTENCIA EN LA NUBE — Supabase
 ===================================================================== */
 const SUPABASE_URL = 'https://rbpsdtsprnbzsloudbsz.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_qhImGGKzda-uR12-yE7wZg_xpXfyKK4';
 
 let supabaseClient = null;
+let cloudReady = false;
+let cloudLoading = false;
+let applyingCloudData = false;
+
 try {
   if (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY) {
     supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -895,56 +899,92 @@ function setCloudStatus(msg) {
   if (el) el.textContent = '☁️ Nube: ' + msg;
 }
 
+function describeSupabaseError(err) {
+  if (!err) return 'Error desconocido';
+  return [err.message, err.details, err.hint, err.code].filter(Boolean).join(' | ');
+}
+
 async function saveToCloud() {
-  if (!supabaseClient) return;
+  if (!supabaseClient || !cloudReady || cloudLoading || applyingCloudData) return false;
   try {
     setCloudStatus('Sincronizando...');
+    const payload = {
+      id: 'global_state',
+      data: JSON.parse(JSON.stringify(state)),
+      updated_at: new Date().toISOString()
+    };
     const { error } = await supabaseClient
       .from('cima_data')
-      .upsert({ id: 'global_state', data: state });
+      .upsert(payload, { onConflict: 'id' });
     if (error) throw error;
     const now = new Date().toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' });
     setCloudStatus('Sincronizado ' + now + ' ✅');
+    return true;
   } catch (err) {
     console.error('Error al guardar en Supabase:', err);
     setCloudStatus('Error de sincronización');
+    showToast('Supabase: ' + describeSupabaseError(err));
+    return false;
   }
 }
 
 async function loadFromCloud() {
-  if (!supabaseClient) return;
+  if (!supabaseClient) {
+    setCloudStatus('Cliente no disponible');
+    return;
+  }
+  cloudLoading = true;
   try {
     setCloudStatus('Cargando de la nube...');
-    const { data, error } = await supabaseClient
+    const { data: row, error } = await supabaseClient
       .from('cima_data')
-      .select('data')
+      .select('id,data,updated_at')
       .eq('id', 'global_state')
       .maybeSingle();
-
     if (error) throw error;
-    if (data && data.data) {
-      applyImportedData(data.data);
-      setCloudStatus('Conectado a la nube ✅');
-      showToast('Datos cargados de la nube ✅');
+
+    if (row && row.data) {
+      applyingCloudData = true;
+      try { applyImportedData(row.data, true); }
+      finally { applyingCloudData = false; }
+      cloudReady = true;
+      const time = row.updated_at
+        ? new Date(row.updated_at).toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' })
+        : null;
+      setCloudStatus(time ? 'Conectado · ' + time + ' ✅' : 'Conectado a la nube ✅');
+      showToast('Datos cargados de Supabase');
     } else {
+      cloudReady = true;
       await saveToCloud();
+      setCloudStatus('Conectado a la nube · estado inicial creado ✅');
     }
   } catch (err) {
+    cloudReady = false;
     console.error('Error al leer de Supabase:', err);
-    setCloudStatus('Modo local (sin nube)');
+    setCloudStatus('Error: ' + (err.code || 'conexión'));
+    showToast('Supabase: ' + describeSupabaseError(err));
+  } finally {
+    cloudLoading = false;
   }
 }
 
 if (supabaseClient) {
   supabaseClient
-    .channel('public:cima_data')
-    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'cima_data' }, payload => {
-      if (payload.new && payload.new.data) {
-        applyImportedData(payload.new.data);
-        showToast('Datos actualizados en tiempo real 🔄');
-      }
+    .channel('cima-data-realtime')
+    .on('postgres_changes', {
+      event: '*', schema: 'public', table: 'cima_data', filter: 'id=eq.global_state'
+    }, payload => {
+      if (!payload.new || !payload.new.data || cloudLoading) return;
+      applyingCloudData = true;
+      try { applyImportedData(payload.new.data, true); }
+      finally { applyingCloudData = false; }
+      cloudReady = true;
+      showToast('Datos actualizados en tiempo real');
     })
-    .subscribe();
+    .subscribe(status => {
+      if (status === 'SUBSCRIBED') console.info('Supabase Realtime conectado');
+      else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') console.warn('Supabase Realtime:', status);
+    });
 }
 
 /* =====================================================================
@@ -1171,9 +1211,11 @@ function saveState(){
   try{
     const str = JSON.stringify(state);
     ALL_POSSIBLE_KEYS.forEach(k => localStorage.setItem(k, str));
-    
+
     clearTimeout(cloudDebounceTimer);
-    cloudDebounceTimer = setTimeout(() => saveToCloud(), 1500);
+    cloudDebounceTimer = setTimeout(() => {
+      if (cloudReady && !cloudLoading && !applyingCloudData) saveToCloud();
+    }, 1500);
   }catch(e){
     console.error('Error guardando', e);
     showToast('⚠️ Error al guardar automáticamente');
@@ -1240,7 +1282,17 @@ document.getElementById('btnExport').addEventListener('click', ()=>{
   showToast('Respaldo descargado ✅');
 });
 
-function applyImportedData(data){
+function applyImportedData(data, replaceState = false){
+  if(!data) return;
+
+  if(replaceState && typeof data === 'object' && !Array.isArray(data)){
+    state = normalizeState(JSON.parse(JSON.stringify(data)));
+    ALL_POSSIBLE_KEYS.forEach(k => localStorage.setItem(k, JSON.stringify(state)));
+    renderAll();
+    return;
+  }
+
+
   if(!data) return;
 
   let incomingProps = [];
