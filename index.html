@@ -1104,12 +1104,12 @@ function normalizeState(data){
       facebook: data.templates.map(t=>({id: uid(), title: t.title, text: t.text})),
     };
   }
-  if(!data.templates.whatsapp || !data.templates.whatsapp.length){
-    data.templates.whatsapp = DEFAULT_TEMPLATES_WHATSAPP.map(t=>({id:uid(), ...t}));
-  }
-  if(!data.templates.facebook || !data.templates.facebook.length){
-    data.templates.facebook = DEFAULT_TEMPLATES_FACEBOOK.map(t=>({id:uid(), ...t}));
-  }
+  // IMPORTANTE: un grupo de plantillas vacío es válido. Antes, si se eliminaban
+  // todas las plantillas de WhatsApp o Facebook, normalizeState() interpretaba el
+  // array vacío como un error y volvía a crear las plantillas por defecto.
+  // Solo inicializamos un grupo si la clave realmente no existe.
+  if(!Array.isArray(data.templates.whatsapp)) data.templates.whatsapp = [];
+  if(!Array.isArray(data.templates.facebook)) data.templates.facebook = [];
 
   data.properties.forEach(p => normalizeProperty(p, data.folders[0]));
   return data;
@@ -3015,7 +3015,7 @@ function bindTemplateActionButtons(container){
     });
   });
   container.querySelectorAll('.btn-remove-tpl').forEach(btn=>{
-    btn.addEventListener('click', ()=>{
+    btn.addEventListener('click', async ()=>{
       if(!confirm('¿Eliminar este mensaje?')) return;
       const group = btn.dataset.group;
       const templateId = btn.dataset.id;
