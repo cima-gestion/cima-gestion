@@ -949,42 +949,46 @@ function mergeCloudState(remoteData, localData){
 
 async function saveToCloud() {
   if (!supabaseClient || !cloudReady || cloudLoading || applyingCloudData) return false;
+  if (!cloudSaveQueued) return true;
+
   try {
     setCloudStatus('Sincronizando...');
 
-    // 1) Ver si alguien más guardó cambios que todavía no tenemos localmente.
-    const { data: remoteRow, error: fetchErr } = await supabaseClient
-      .from('cima_data')
-      .select('id,data,updated_at')
-      .eq('id', 'global_state')
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
+    // No hacemos un SELECT antes de cada guardado. Realtime ya informa de los
+    // cambios remotos; esta comprobación periódica funciona como reconciliación
+    // de respaldo por si se perdió una notificación.
+    const nowMs = Date.now();
+    if (nowMs - lastCloudCheckAt >= CLOUD_RECONCILE_INTERVAL) {
+      const { data: remoteRow, error: fetchErr } = await supabaseClient
+        .from('cima_data')
+        .select('id,data,updated_at')
+        .eq('id', 'global_state')
+        .maybeSingle();
+      if (fetchErr) throw fetchErr;
+      lastCloudCheckAt = nowMs;
 
-    let stateToSave = state;
-    if (remoteRow && remoteRow.data && remoteRow.updated_at !== lastKnownRemoteUpdatedAt) {
-      // Hay una versión en la nube más nueva que la última que vimos: fusionamos
-      // en vez de pisarla.
-      stateToSave = mergeCloudState(remoteRow.data, state);
-      applyingCloudData = true;
-      try {
+      if (remoteRow && remoteRow.data && remoteRow.updated_at !== lastKnownRemoteUpdatedAt) {
+        const stateToSave = mergeCloudState(remoteRow.data, state);
         state = stateToSave;
-        ALL_POSSIBLE_KEYS.forEach(k => localStorage.setItem(k, JSON.stringify(state)));
-        renderAll();
-      } finally {
-        applyingCloudData = false;
+        persistLocalState();
+        renderCurrentTab();
+        lastKnownRemoteUpdatedAt = remoteRow.updated_at;
       }
     }
 
     const payload = {
       id: 'global_state',
-      data: JSON.parse(JSON.stringify(stateToSave)),
+      data: JSON.parse(JSON.stringify(state)),
       updated_at: new Date().toISOString()
     };
+
     lastSavedUpdatedAt = payload.updated_at;
     const { error } = await supabaseClient
       .from('cima_data')
       .upsert(payload, { onConflict: 'id' });
     if (error) throw error;
+
+    cloudSaveQueued = false;
     lastKnownRemoteUpdatedAt = payload.updated_at;
     const now = new Date().toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' });
     setCloudStatus('Sincronizado ' + now + ' ✅');
@@ -993,6 +997,8 @@ async function saveToCloud() {
     console.error('Error al guardar en Supabase:', err);
     setCloudStatus('Error de sincronización');
     showToast('Supabase: ' + describeSupabaseError(err));
+    // Mantener la cola activa permite reintentar sin perder el cambio local.
+    cloudSaveQueued = true;
     return false;
   }
 }
@@ -1025,6 +1031,7 @@ async function loadFromCloud() {
       showToast('Datos cargados de Supabase');
     } else {
       cloudReady = true;
+      cloudSaveQueued = true;
       await saveToCloud();
       setCloudStatus('Conectado a la nube · estado inicial creado ✅');
     }
@@ -1053,7 +1060,7 @@ if (supabaseClient) {
         return;
       }
       applyingCloudData = true;
-      try { applyImportedData(payload.new.data, true); }
+      try { applyImportedData(payload.new.data, true, true); }
       finally { applyingCloudData = false; }
       cloudReady = true;
       lastKnownRemoteUpdatedAt = payload.new.updated_at || null;
@@ -1286,19 +1293,36 @@ let state = loadState();
 if(!Array.isArray(state.bitacora)) state.bitacora = [];
 
 let cloudDebounceTimer = null;
-function saveState(){
-  try{
-    const str = JSON.stringify(state);
-    ALL_POSSIBLE_KEYS.forEach(k => localStorage.setItem(k, str));
+let localSaveTimer = null;
+let cloudSaveQueued = false;
+let lastCloudCheckAt = 0;
+const CLOUD_RECONCILE_INTERVAL = 15000;
 
-    clearTimeout(cloudDebounceTimer);
-    cloudDebounceTimer = setTimeout(() => {
-      if (cloudReady && !cloudLoading && !applyingCloudData) saveToCloud();
-    }, 2500);
+// Persistencia local ligera: una sola clave es suficiente durante el uso normal.
+// Las claves antiguas se conservan para recuperación/migración, pero ya no se
+// reescriben en cada clic, cambio o edición.
+function persistLocalState(){
+  try{
+    localStorage.setItem(PRIMARY_KEY, JSON.stringify(state));
   }catch(e){
-    console.error('Error guardando', e);
+    console.error('Error guardando localmente', e);
     showToast('⚠️ Error al guardar automáticamente');
   }
+}
+
+function saveState(){
+  // Agrupa varios cambios realizados en el mismo instante para evitar
+  // serializar todo el estado repetidamente.
+  clearTimeout(localSaveTimer);
+  localSaveTimer = setTimeout(() => {
+    persistLocalState();
+  }, 60);
+
+  cloudSaveQueued = true;
+  clearTimeout(cloudDebounceTimer);
+  cloudDebounceTimer = setTimeout(() => {
+    if (cloudReady && !cloudLoading && !applyingCloudData) saveToCloud();
+  }, 2500);
 }
 
 function showToast(msg){
@@ -1317,6 +1341,7 @@ document.querySelectorAll('.tab-btn').forEach(btn=>{
     document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById('panel-'+btn.dataset.tab).classList.add('active');
+    renderCurrentTab();
     if(btn.dataset.tab==='dossier') loadDossierStudio();
   });
 });
@@ -1361,13 +1386,13 @@ document.getElementById('btnExport').addEventListener('click', ()=>{
   showToast('Respaldo descargado ✅');
 });
 
-function applyImportedData(data, replaceState = false){
+function applyImportedData(data, replaceState = false, lazyRender = false){
   if(!data) return;
 
   if(replaceState && typeof data === 'object' && !Array.isArray(data)){
     state = normalizeState(JSON.parse(JSON.stringify(data)));
-    ALL_POSSIBLE_KEYS.forEach(k => localStorage.setItem(k, JSON.stringify(state)));
-    renderAll();
+    persistLocalState();
+    if(lazyRender) renderCurrentTab(); else renderAll();
     return;
   }
 
@@ -1417,8 +1442,8 @@ function applyImportedData(data, replaceState = false){
   }
 
   normalizeState(state);
-  ALL_POSSIBLE_KEYS.forEach(k => localStorage.setItem(k, JSON.stringify(state)));
-  renderAll();
+  persistLocalState();
+  if(lazyRender) renderCurrentTab(); else renderAll();
 }
 
 document.getElementById('btnImportTrigger').addEventListener('click', ()=>{
@@ -1682,6 +1707,8 @@ const SUPPORTS_FOLDER_LINK = 'showDirectoryPicker' in window;
 const IMAGE_EXT = /\.(jpe?g|png|webp|gif)$/i;
 const folderThumbCache = {};
 const folderThumbUrls = {};
+const folderHandleCache = {};
+const folderGalleryPending = new Set();
 
 const FOLDER_DB_NAME = 'cima_panel_folders';
 const FOLDER_DB_VERSION = 1;
@@ -1741,41 +1768,16 @@ function folderBlockHtml(prop){
   return `<div class="folder-gallery" id="folderGallery-${prop.id}"><div class="empty-hint">Cargando…</div></div>`;
 }
 
-async function refreshFolderGallery(propId){
-  const container = document.getElementById('folderGallery-'+propId);
+function renderCachedFolderGallery(propId, container, handle, files){
   if(!container) return;
-
-  let handle = null;
-  try{ handle = await getFolderHandle(propId); }catch(e){ console.error(e); }
-
-  if(!handle){
-    container.innerHTML = `<button class="ghost small btn-link-folder" data-prop="${propId}">🔗 Vincular carpeta de fotos</button>`;
-    attachFolderButtonListeners(container);
-    return;
-  }
-
-  let permission = 'denied';
-  try{ permission = await handle.queryPermission({ mode:'read' }); }catch(e){}
-
-  if(permission !== 'granted'){
-    container.innerHTML = `
-      <div class="hint" style="margin-bottom:6px;">📁 ${escapeHtml(handle.name)} — falta confirmar el permiso</div>
-      <button class="ghost small btn-reconnect-folder" data-prop="${propId}">🔓 Reconectar carpeta</button>
-      <button class="ghost small danger btn-unlink-folder" data-prop="${propId}">Desvincular</button>`;
-    attachFolderButtonListeners(container);
-    return;
-  }
-
-  let files = [];
-  try{ files = await listImagesInFolder(handle); }catch(e){ console.error(e); }
-  folderThumbCache[propId] = files;
-
   const thumbsHtml = files.length
-    ? `<div class="folder-thumbs">` + files.map((f,i)=>`
-        <div class="folder-thumb">
-          <img data-lazy-file="${escapeAttr(f.name)}" alt="${escapeAttr(f.name)}">
+    ? `<div class="folder-thumbs">` + files.map((f,i)=>{
+        const cachedUrl = folderThumbUrls[propId] && folderThumbUrls[propId][f.name];
+        return `<div class="folder-thumb">
+          <img data-lazy-file="${escapeAttr(f.name)}" ${cachedUrl ? `src="${cachedUrl}"` : ''} loading="lazy" alt="${escapeAttr(f.name)}">
           <button class="ghost small btn-copy-photo" data-prop="${propId}" data-idx="${i}" title="Copiar imagen al portapapeles">📋</button>
-        </div>`).join('') + `</div>`
+        </div>`;
+      }).join('') + `</div>`
     : `<div class="empty-hint">No se encontraron imágenes (jpg/png/webp) en esta carpeta.</div>`;
 
   container.innerHTML = `
@@ -1787,22 +1789,85 @@ async function refreshFolderGallery(propId){
     </div>
     ${thumbsHtml}`;
 
-  (folderThumbUrls[propId] || []).forEach(u=> URL.revokeObjectURL(u));
-  folderThumbUrls[propId] = [];
+  if(!folderThumbUrls[propId]) folderThumbUrls[propId] = {};
 
-  container.querySelectorAll('img[data-lazy-file]').forEach(async (img)=>{
-    const name = img.getAttribute('data-lazy-file');
-    const entry = files.find(f=>f.name===name);
-    if(!entry) return;
+  // Solo crea object URLs cuando aún no existen. Los renders posteriores
+  // reutilizan las mismas URLs y no vuelven a leer todas las fotos del disco.
+  files.forEach(async f => {
+    if(folderThumbUrls[propId][f.name]) return;
     try{
-      const file = await entry.handle.getFile();
+      const file = await f.handle.getFile();
       const url = URL.createObjectURL(file);
-      img.src = url;
-      folderThumbUrls[propId].push(url);
-    }catch(e){ console.error('No se pudo leer', name, e); }
+      folderThumbUrls[propId][f.name] = url;
+      const img = container.querySelector(`img[data-lazy-file="${CSS.escape(f.name)}"]`);
+      if(img && !img.src) img.src = url;
+    }catch(e){ console.error('No se pudo leer', f.name, e); }
   });
 
   attachFolderButtonListeners(container);
+}
+
+async function refreshFolderGallery(propId, force=false){
+  const container = document.getElementById('folderGallery-'+propId);
+  if(!container) return;
+
+  // Si ya conocemos la carpeta y sus imágenes, reconstruir la tarjeta es barato:
+  // no abre IndexedDB ni vuelve a recorrer el directorio.
+  if(!force && folderHandleCache[propId] && Array.isArray(folderThumbCache[propId])){
+    renderCachedFolderGallery(propId, container, folderHandleCache[propId], folderThumbCache[propId]);
+    return;
+  }
+
+  // Evita dos lecturas simultáneas del mismo directorio cuando hay renders
+  // consecutivos muy rápidos.
+  if(folderGalleryPending.has(propId)) return;
+  folderGalleryPending.add(propId);
+
+  try{
+    let handle = folderHandleCache[propId] || null;
+    if(!handle){
+      try{ handle = await getFolderHandle(propId); }catch(e){ console.error(e); }
+      if(handle) folderHandleCache[propId] = handle;
+    }
+
+    if(!handle){
+      folderThumbCache[propId] = [];
+      container.innerHTML = `<button class="ghost small btn-link-folder" data-prop="${propId}">🔗 Vincular carpeta de fotos</button>`;
+      attachFolderButtonListeners(container);
+      return;
+    }
+
+    let permission = 'denied';
+    try{ permission = await handle.queryPermission({ mode:'read' }); }catch(e){}
+
+    if(permission !== 'granted'){
+      container.innerHTML = `
+        <div class="hint" style="margin-bottom:6px;">📁 ${escapeHtml(handle.name)} — falta confirmar el permiso</div>
+        <button class="ghost small btn-reconnect-folder" data-prop="${propId}">🔓 Reconectar carpeta</button>
+        <button class="ghost small danger btn-unlink-folder" data-prop="${propId}">Desvincular</button>`;
+      attachFolderButtonListeners(container);
+      return;
+    }
+
+    let files = [];
+    try{ files = await listImagesInFolder(handle); }catch(e){ console.error(e); }
+    folderThumbCache[propId] = files;
+    if(!folderThumbUrls[propId]) folderThumbUrls[propId] = {};
+
+    // Revocar URLs que ya no corresponden a archivos existentes después de un
+    // refresco manual de la carpeta.
+    const names = new Set(files.map(f=>f.name));
+    Object.keys(folderThumbUrls[propId]).forEach(name=>{
+      if(!names.has(name)){
+        try{ URL.revokeObjectURL(folderThumbUrls[propId][name]); }catch(e){}
+        delete folderThumbUrls[propId][name];
+      }
+    });
+
+    renderCachedFolderGallery(propId, container, handle, files);
+  } finally {
+    folderGalleryPending.delete(propId);
+  }
 }
 
 function attachFolderButtonListeners(container){
@@ -1812,7 +1877,7 @@ function attachFolderButtonListeners(container){
       const handle = await window.showDirectoryPicker();
       await saveFolderHandle(linkBtn.dataset.prop, handle);
       showToast('Carpeta vinculada ✅');
-      refreshFolderGallery(linkBtn.dataset.prop);
+      refreshFolderGallery(linkBtn.dataset.prop, true);
     }catch(e){
       if(e.name !== 'AbortError') showToast('No se pudo vincular la carpeta');
     }
@@ -1826,16 +1891,23 @@ function attachFolderButtonListeners(container){
     try{
       const perm = await handle.requestPermission({ mode:'read' });
       if(perm !== 'granted'){ showToast('Permiso denegado'); return; }
-      refreshFolderGallery(propId);
+      refreshFolderGallery(propId, true);
     }catch(e){ showToast('No se pudo confirmar el permiso'); }
   });
 
   const unlinkBtn = container.querySelector('.btn-unlink-folder');
   if(unlinkBtn) unlinkBtn.addEventListener('click', async ()=>{
     if(!confirm('¿Desvincular esta carpeta? Las fotos seguirán intactas en tu equipo.')) return;
-    await deleteFolderHandle(unlinkBtn.dataset.prop);
+    const propId = unlinkBtn.dataset.prop;
+    await deleteFolderHandle(propId);
+    folderHandleCache[propId] = null;
+    folderThumbCache[propId] = [];
+    if(folderThumbUrls[propId]){
+      Object.values(folderThumbUrls[propId]).forEach(u=>{ try{ URL.revokeObjectURL(u); }catch(e){} });
+      folderThumbUrls[propId] = {};
+    }
     showToast('Carpeta desvinculada');
-    refreshFolderGallery(unlinkBtn.dataset.prop);
+    refreshFolderGallery(propId, true);
   });
 
   const useBtn = container.querySelector('.btn-use-in-watermark');
@@ -3222,6 +3294,36 @@ function escapeHtml(str){
   return String(str||'').replace(/[&<>"']/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
 function escapeAttr(str){ return escapeHtml(str); }
+
+function renderCurrentTab(){
+  const activeBtn = document.querySelector('.tab-btn.active');
+  const tab = activeBtn ? activeBtn.dataset.tab : 'publicaciones';
+
+  switch(tab){
+    case 'publicaciones':
+      renderPlatformsList();
+      renderProperties();
+      updateDailyRepublicationProgress();
+      break;
+    case 'seguimiento':
+      renderLeads();
+      break;
+    case 'plantillas':
+      renderTemplatesWhatsapp();
+      renderTemplatesFacebook();
+      break;
+    case 'estadisticas':
+      renderEstadisticas();
+      break;
+    case 'bitacora':
+      renderBitacora();
+      break;
+    case 'fotos':
+    case 'dossier':
+    default:
+      break;
+  }
+}
 
 function renderAll(){
   renderPlatformsList();
