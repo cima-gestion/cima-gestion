@@ -1082,9 +1082,9 @@ function normalizeState(data){
     }
   });
 
-  DEFAULT_FOLDERS.forEach(f => {
-    if(!data.folders.includes(f)) data.folders.push(f);
-  });
+  // No volver a crear carpetas por defecto aquí.
+  // Las carpetas eliminadas son una acción válida y, si las recreamos durante
+  // la normalización, reaparecen después de sincronizar o recargar la app.
 
   if(!data.sortOrder) data.sortOrder = 'price-asc';
   if(!data.collapsedFolders) data.collapsedFolders = {};
@@ -2140,16 +2140,36 @@ function renderProperties(){
   }
 
   container.querySelectorAll('.btn-delete-folder').forEach(btn=>{
-    btn.addEventListener('click', (e)=>{
+    btn.addEventListener('click', async (e)=>{
       e.stopPropagation();
       const fName = btn.dataset.folder;
       if(!confirm(`¿Eliminar la carpeta "${fName}"?`)) return;
+
+      // Primero eliminar la carpeta real de Supabase. Antes solo se quitaba
+      // del estado local, por lo que seguía existiendo en la nube y reaparecía.
+      if(supabaseClient){
+        const { error } = await supabaseClient
+          .from('folders')
+          .delete()
+          .eq('name', fName);
+        if(error){
+          console.error('Error al eliminar carpeta en Supabase:', error);
+          showToast('No se pudo eliminar la carpeta: ' + describeSupabaseError(error));
+          return;
+        }
+      }
+
       state.folders = state.folders.filter(f => f !== fName);
       if(state.collapsedFolders) delete state.collapsedFolders[fName];
+
+      // Reasignar las propiedades antes de sincronizar para que ninguna
+      // propiedad conserve una referencia a la carpeta eliminada.
       const target = state.folders[0] || 'General';
       state.properties.forEach(p => { if(p.folder === fName) p.folder = target; });
+
       saveState();
       renderProperties();
+      showToast(`Carpeta "${fName}" eliminada`);
     });
   });
 
