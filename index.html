@@ -3018,9 +3018,33 @@ function bindTemplateActionButtons(container){
     btn.addEventListener('click', ()=>{
       if(!confirm('¿Eliminar este mensaje?')) return;
       const group = btn.dataset.group;
-      state.templates[group] = state.templates[group].filter(x=>x.id!==btn.dataset.id);
+      const templateId = btn.dataset.id;
+
+      // IMPORTANTE: antes solo quitábamos la plantilla del estado local.
+      // saveToCloud() hacía UPSERT de las existentes, pero nunca DELETE en Supabase,
+      // por eso al recargar se volvía a descargar y "resucitaba".
+      // Eliminamos primero en la nube y solo confirmamos la eliminación local si
+      // Supabase respondió correctamente.
+      if (supabaseClient && cloudReady) {
+        try {
+          setCloudStatus('Eliminando mensaje...');
+          const { error } = await supabaseClient
+            .from('templates')
+            .delete()
+            .eq('id', templateId);
+          if (error) throw error;
+        } catch (err) {
+          console.error('Error eliminando plantilla en Supabase:', err);
+          setCloudStatus('Error de sincronización');
+          showToast('No se pudo eliminar en la nube: ' + describeSupabaseError(err));
+          return;
+        }
+      }
+
+      state.templates[group] = state.templates[group].filter(x=>x.id!==templateId);
       saveState();
       if(group==='whatsapp') renderTemplatesWhatsapp(); else renderTemplatesFacebook();
+      setCloudStatus('Mensaje eliminado y sincronizado ✅');
     });
   });
 }
